@@ -2,9 +2,12 @@ import os
 import cv2
 import numpy as np
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from skimage.color import deltaE_ciede2000, rgb2lab
 
 app = Flask(__name__)
+CORS(app)
+
 
 # Initialize ArUco marker detector (4x4 dictionary)
 aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
