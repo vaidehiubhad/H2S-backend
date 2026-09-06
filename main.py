@@ -4,25 +4,42 @@ import numpy as np
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from skimage.color import deltaE_ciede2000, rgb2lab
+from sklearn.ensemble import RandomForestRegressor
 
 app = Flask(__name__)
 CORS(app)
 
+# --- Train the dose-prediction model once, when the server starts ---
+np.random.seed(42)
+n_samples = 400
+true_dose = np.random.uniform(0.5, 50, n_samples)
+noise = np.random.normal(0, 1.2, n_samples)
+a, b = 2.1, 0.74
+delta_e_train = a * (true_dose ** b) + noise
+delta_e_train = np.clip(delta_e_train, 0, None)
 
-# Initialize ArUco marker detector (4x4 dictionary)
+X_train = delta_e_train.reshape(-1, 1)
+y_train = true_dose
+
+model = RandomForestRegressor(n_estimators=150, max_depth=8, random_state=42)
+model.fit(X_train, y_train)
+# --- Model is now ready in memory, no file needed ---
+
 aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 aruco_params = cv2.aruco.DetectorParameters()
 detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
+
 
 @app.route('/', methods=['GET'])
 def health_check():
     return jsonify({"status": "Server is running!"}), 200
 
+
 @app.route('/analyze', methods=['POST'])
 def analyze_dosimeter():
     if 'file' not in request.files:
         return jsonify({"error": "No image uploaded"}), 400
-    
+
     file = request.files['file']
     np_img = np.frombuffer(file.read(), np.uint8)
     image = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
@@ -30,20 +47,17 @@ def analyze_dosimeter():
     if image is None:
         return jsonify({"error": "Invalid image file"}), 400
 
-    # 1. Detect ArUco Marker
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     corners, ids, _ = detector.detectMarkers(gray)
 
     if ids is None:
-        return jsonify({"status": "Error", "message": "Marker ring not found. Re-align camera."}), 400
+        return jsonify({"status": "Error", "message": "Marker ring not found. Make sure the wristband is fully visible and well-lit."}), 400
 
-    # 2. Unwarp perspective to a standard 300x300 square
     dst_pts = np.array([[0, 0], [300, 0], [300, 300], [0, 300]], dtype=np.float32)
     src_pts = corners[0][0].astype(np.float32)
     matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
     warped = cv2.warpPerspective(image, matrix, (300, 300))
 
-    # 3. Light balance normalization using calibration swatch
     white_swatch = warped[20:60, 220:260]
     mean_bgr = cv2.mean(white_swatch)[:3]
     target_rgb = np.array([240.0, 240.0, 240.0])
@@ -53,21 +67,37 @@ def analyze_dosimeter():
     warped_rgb = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB).astype(np.float32)
     normalized_rgb = np.clip(warped_rgb * gain, 0, 255).astype(np.uint8)
 
-    # 4. Extract central patch & compute Delta E
+    unexposed_roi = normalized_rgb[20:60, 20:60]
+    avg_unexposed_rgb = np.mean(unexposed_roi, axis=(0, 1)).reshape(1, 1, 3) / 255.0
+    unexposed_lab = rgb2lab(avg_unexposed_rgb)
+
     patch_roi = normalized_rgb[100:200, 100:200]
     avg_patch_rgb = np.mean(patch_roi, axis=(0, 1)).reshape(1, 1, 3) / 255.0
     current_lab = rgb2lab(avg_patch_rgb)
-    unexposed_lab = rgb2lab(np.array([[[0.95, 0.95, 0.90]]], dtype=np.float32))
 
     delta_e = float(deltaE_ciede2000(unexposed_lab, current_lab)[0][0])
-    ppm_hours = round(float(0.45 * (delta_e ** 1.35)), 2)
-    safety_label = "DANGER" if ppm_hours > 10.0 else "SAFE"
+
+    dose_ppm_hours = round(float(model.predict([[delta_e]])[0]), 2)
+
+    SAFE_LIMIT = 10.0  # ppm·hours
+
+    if dose_ppm_hours <= SAFE_LIMIT:
+        safety_label = "SAFE"
+    else:
+        safety_label = "DANGER"
 
     return jsonify({
         "delta_e": round(delta_e, 2),
-        "ppm_hours": ppm_hours,
-        "status": safety_label
+        "ppm_hours": dose_ppm_hours,
+        "status": safety_label,
+        "safe_limit_ppm_hours": SAFE_LIMIT,
+        "message": (
+            f"Exposure is within safe limits ({dose_ppm_hours} / {SAFE_LIMIT} ppm·h)"
+            if safety_label == "SAFE"
+            else f"⚠ Exposure exceeds safe limit! ({dose_ppm_hours} / {SAFE_LIMIT} ppm·h)"
+        )
     })
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
