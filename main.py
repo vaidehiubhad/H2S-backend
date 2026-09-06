@@ -4,26 +4,13 @@ import numpy as np
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from skimage.color import deltaE_ciede2000, rgb2lab
-from sklearn.ensemble import RandomForestRegressor
 
 app = Flask(__name__)
 CORS(app)
 
-# --- Train the dose-prediction model once, when the server starts ---
-np.random.seed(42)
-n_samples = 400
-true_dose = np.random.uniform(0.5, 50, n_samples)
-noise = np.random.normal(0, 1.2, n_samples)
-a, b = 2.1, 0.74
-delta_e_train = a * (true_dose ** b) + noise
-delta_e_train = np.clip(delta_e_train, 0, None)
-
-X_train = delta_e_train.reshape(-1, 1)
-y_train = true_dose
-
-model = RandomForestRegressor(n_estimators=150, max_depth=8, random_state=42)
-model.fit(X_train, y_train)
-# --- Model is now ready in memory, no file needed ---
+# --- Calibration curve fitted from real test-card measurements ---
+# dose = a*delta_e^2 + b*delta_e + c
+A, B, C = 0.00354432, 0.8518152, 0.35734949
 
 aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 aruco_params = cv2.aruco.DetectorParameters()
@@ -51,9 +38,9 @@ def analyze_dosimeter():
     corners, ids, _ = detector.detectMarkers(gray)
 
     if ids is None:
-        return jsonify({"status": "Error", "message": "Marker ring not found. Make sure the wristband is fully visible and well-lit."}), 400
+        return jsonify({"status": "Error", "message": "Marker not found. Make sure the wristband is fully visible and well-lit."}), 400
 
-    dst_pts = np.array([[0, 0], [300, 0], [300, 300], [0, 300]], dtype=np.float32)
+    dst_pts = np.array([[0, 0], [100, 0], [100, 100], [0, 100]], dtype=np.float32)
     src_pts = corners[0][0].astype(np.float32)
     matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
     warped = cv2.warpPerspective(image, matrix, (300, 300))
@@ -67,24 +54,20 @@ def analyze_dosimeter():
     warped_rgb = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB).astype(np.float32)
     normalized_rgb = np.clip(warped_rgb * gain, 0, 255).astype(np.uint8)
 
-    unexposed_roi = normalized_rgb[20:60, 20:60]
+    unexposed_roi = normalized_rgb[120:160, 20:60]
     avg_unexposed_rgb = np.mean(unexposed_roi, axis=(0, 1)).reshape(1, 1, 3) / 255.0
     unexposed_lab = rgb2lab(avg_unexposed_rgb)
 
-    patch_roi = normalized_rgb[100:200, 100:200]
+    patch_roi = normalized_rgb[140:240, 140:240]
     avg_patch_rgb = np.mean(patch_roi, axis=(0, 1)).reshape(1, 1, 3) / 255.0
     current_lab = rgb2lab(avg_patch_rgb)
 
     delta_e = float(deltaE_ciede2000(unexposed_lab, current_lab)[0][0])
 
-    dose_ppm_hours = round(float(model.predict([[delta_e]])[0]), 2)
+    dose_ppm_hours = round(A * delta_e**2 + B * delta_e + C, 2)
+    SAFE_LIMIT = 10.0
 
-    SAFE_LIMIT = 10.0  # ppm·hours
-
-    if dose_ppm_hours <= SAFE_LIMIT:
-        safety_label = "SAFE"
-    else:
-        safety_label = "DANGER"
+    safety_label = "SAFE" if dose_ppm_hours <= SAFE_LIMIT else "DANGER"
 
     return jsonify({
         "delta_e": round(delta_e, 2),
