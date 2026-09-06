@@ -3,3 +3,5 @@ flask-cors
 opencv-python-headless
 numpy
 scikit-image
+scikit-learn
+joblib
