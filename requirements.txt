@@ -1,5 +1,5 @@
 flask
-gunicorn
+flask-cors
 opencv-python-headless
 numpy
 scikit-image
