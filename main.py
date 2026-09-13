@@ -66,6 +66,20 @@ def analyze_dosimeter():
     mean_bgr = cv2.mean(white_swatch)[:3]
     target_rgb = np.array([240.0, 240.0, 240.0])
     measured_rgb = np.array([mean_bgr[2], mean_bgr[1], mean_bgr[0]], dtype=np.float32)
+
+    # --- Photo quality check ---
+    avg_brightness = np.mean(measured_rgb)
+    if avg_brightness < 100:
+        return jsonify({
+            "status": "Error",
+            "message": "Photo is too dark. Please retake in better lighting."
+        }), 400
+    if avg_brightness > 250:
+        return jsonify({
+            "status": "Error",
+            "message": "Photo is overexposed/too bright (glare). Please retake avoiding direct light reflection."
+        }), 400
+
     gain = target_rgb / np.maximum(measured_rgb, 1.0)
     warped_rgb = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB).astype(np.float32)
     normalized_rgb = np.clip(warped_rgb * gain, 0, 255).astype(np.uint8)
