@@ -11,6 +11,7 @@ CORS(app)
 
 A, B, C = 0.00354432, 0.8518152, 0.35734949
 SAFE_LIMIT = 8.0
+DANGER_LIMIT = 20.0
 STANDARD_REFERENCE = "ACGIH TLV 8-hr TWA (1 ppm) | OSHA PEL ceiling 20 ppm | NIOSH REL ceiling 10 ppm/10min"
 
 aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
@@ -54,61 +55,61 @@ def analyze_dosimeter():
             src_pts.append(corners[i][0][corner_pick[marker_id]])
             dst_pts.append(ideal_positions[marker_id])
 
-    if len(src_pts) < 3:
-        return jsonify({"status": "Error", "message": "Not enough visible corner markers to align the wristband."}), 400
+    if len(src_pts) < 4:
+        return jsonify({"status": "Error", "message": "All 4 corner markers must be visible to align the wristband."}), 400
 
     src_pts = np.array(src_pts, dtype=np.float32)
     dst_pts = np.array(dst_pts, dtype=np.float32)
     matrix, _ = cv2.findHomography(src_pts, dst_pts)
     warped = cv2.warpPerspective(image, matrix, (CARD_SIZE, CARD_SIZE))
 
-    white_swatch = warped[20:60, 220:260]
+    # --- FIXED: patches repositioned so they never overlap the corner markers ---
+    white_swatch = warped[20:60, 130:170]
     mean_bgr = cv2.mean(white_swatch)[:3]
     target_rgb = np.array([240.0, 240.0, 240.0])
     measured_rgb = np.array([mean_bgr[2], mean_bgr[1], mean_bgr[0]], dtype=np.float32)
 
-    # --- Photo quality check ---
     avg_brightness = np.mean(measured_rgb)
     if avg_brightness < 100:
-        return jsonify({
-            "status": "Error",
-            "message": "Photo is too dark. Please retake in better lighting."
-        }), 400
+        return jsonify({"status": "Error", "message": "Photo is too dark. Please retake in better lighting."}), 400
     if avg_brightness > 250:
-        return jsonify({
-            "status": "Error",
-            "message": "Photo is overexposed/too bright (glare). Please retake avoiding direct light reflection."
-        }), 400
+        return jsonify({"status": "Error", "message": "Photo is overexposed/too bright (glare). Please retake avoiding direct light reflection."}), 400
 
     gain = target_rgb / np.maximum(measured_rgb, 1.0)
     warped_rgb = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB).astype(np.float32)
     normalized_rgb = np.clip(warped_rgb * gain, 0, 255).astype(np.uint8)
 
-    unexposed_roi = normalized_rgb[120:160, 20:60]
+    unexposed_roi = normalized_rgb[130:170, 20:60]
     avg_unexposed_rgb = np.mean(unexposed_roi, axis=(0, 1)).reshape(1, 1, 3) / 255.0
     unexposed_lab = rgb2lab(avg_unexposed_rgb)
 
-    patch_roi = normalized_rgb[140:240, 140:240]
+    patch_roi = normalized_rgb[130:220, 130:220]
     avg_patch_rgb = np.mean(patch_roi, axis=(0, 1)).reshape(1, 1, 3) / 255.0
     current_lab = rgb2lab(avg_patch_rgb)
 
     delta_e = float(deltaE_ciede2000(unexposed_lab, current_lab)[0][0])
     dose_ppm_hours = round(A * delta_e**2 + B * delta_e + C, 2)
-    safety_label = "SAFE" if dose_ppm_hours <= SAFE_LIMIT else "DANGER"
+
+    if dose_ppm_hours <= SAFE_LIMIT:
+        safety_label = "SAFE"
+        message = f"✅ SAFE: Exposure within limits ({dose_ppm_hours} / {SAFE_LIMIT} ppm·h, per ACGIH TWA)"
+    elif dose_ppm_hours <= DANGER_LIMIT:
+        safety_label = "MODERATE"
+        message = f"⚠ MODERATE: Elevated exposure ({dose_ppm_hours} ppm·h) — monitor closely, limit further exposure."
+    else:
+        safety_label = "DANGER"
+        message = f"🛑 DANGER: Exposure exceeds safe limit! ({dose_ppm_hours} ppm·h) — remove worker from area and seek fresh air immediately."
 
     return jsonify({
         "delta_e": round(delta_e, 2),
         "ppm_hours": dose_ppm_hours,
         "status": safety_label,
         "safe_limit_ppm_hours": SAFE_LIMIT,
+        "danger_limit_ppm_hours": DANGER_LIMIT,
         "standard_reference": STANDARD_REFERENCE,
         "markers_detected": len(src_pts),
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "message": (
-            f"✅ Exposure within safe limits ({dose_ppm_hours} / {SAFE_LIMIT} ppm·h, per ACGIH TWA)"
-            if safety_label == "SAFE"
-            else f"⚠ DANGER: Exposure exceeds safe limit! ({dose_ppm_hours} / {SAFE_LIMIT} ppm·h) — remove worker from area and seek fresh air immediately."
-        ),
+        "message": message,
         "disclaimer": "Prototype device for demonstration only. Not certified for occupational safety compliance. Always follow official workplace gas monitoring protocols."
     })
 
