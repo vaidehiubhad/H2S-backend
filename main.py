@@ -19,6 +19,16 @@ aruco_params = cv2.aruco.DetectorParameters()
 detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
 
 
+def srgb_to_linear(c):
+    c = c / 255.0
+    return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+
+
+def linear_to_srgb(c):
+    out = np.where(c <= 0.0031308, c * 12.92, 1.055 * np.power(np.clip(c, 0, 1), 1 / 2.4) - 0.055)
+    return np.clip(out * 255.0, 0, 255)
+
+
 @app.route('/', methods=['GET'])
 def health_check():
     return jsonify({"status": "Server is running!"}), 200
@@ -62,22 +72,35 @@ def analyze_dosimeter():
     dst_pts = np.array(dst_pts, dtype=np.float32)
     matrix, _ = cv2.findHomography(src_pts, dst_pts)
     warped = cv2.warpPerspective(image, matrix, (CARD_SIZE, CARD_SIZE))
+    warped_rgb = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB).astype(np.float32)
 
-    # --- FIXED: patches repositioned so they never overlap the corner markers ---
-    white_swatch = warped[20:60, 130:170]
-    mean_bgr = cv2.mean(white_swatch)[:3]
-    target_rgb = np.array([240.0, 240.0, 240.0])
-    measured_rgb = np.array([mean_bgr[2], mean_bgr[1], mean_bgr[0]], dtype=np.float32)
+    # --- Reference patches (repositioned to avoid overlapping the 4 corner markers) ---
+    white_roi = warped_rgb[20:60, 130:170]
+    gray_roi = warped_rgb[130:170, 240:280]     # NEW: second reference patch (mid-gray)
 
-    avg_brightness = np.mean(measured_rgb)
+    white_measured = np.mean(white_roi.reshape(-1, 3), axis=0)
+    gray_measured = np.mean(gray_roi.reshape(-1, 3), axis=0)
+
+    avg_brightness = np.mean(white_measured)
     if avg_brightness < 100:
         return jsonify({"status": "Error", "message": "Photo is too dark. Please retake in better lighting."}), 400
     if avg_brightness > 250:
         return jsonify({"status": "Error", "message": "Photo is overexposed/too bright (glare). Please retake avoiding direct light reflection."}), 400
 
-    gain = target_rgb / np.maximum(measured_rgb, 1.0)
-    warped_rgb = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB).astype(np.float32)
-    normalized_rgb = np.clip(warped_rgb * gain, 0, 255).astype(np.uint8)
+    # --- Two-point calibration, done in LINEAR light ---
+    white_target = srgb_to_linear(np.array([240.0, 240.0, 240.0]))
+    gray_target = srgb_to_linear(np.array([120.0, 120.0, 120.0]))
+
+    white_lin = srgb_to_linear(white_measured)
+    gray_lin = srgb_to_linear(gray_measured)
+
+    denom = np.where(np.abs(white_lin - gray_lin) < 1e-6, 1e-6, white_lin - gray_lin)
+    a_coef = (white_target - gray_target) / denom
+    b_coef = white_target - a_coef * white_lin
+
+    full_lin = srgb_to_linear(warped_rgb)
+    corrected_lin = np.clip(full_lin * a_coef + b_coef, 0, 1)
+    normalized_rgb = linear_to_srgb(corrected_lin).astype(np.uint8)
 
     unexposed_roi = normalized_rgb[130:170, 20:60]
     avg_unexposed_rgb = np.mean(unexposed_roi, axis=(0, 1)).reshape(1, 1, 3) / 255.0
