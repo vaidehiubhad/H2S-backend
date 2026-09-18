@@ -9,10 +9,15 @@ from skimage.color import deltaE_ciede2000, rgb2lab
 app = Flask(__name__)
 CORS(app)
 
-A, B, C = 0.00354432, 0.8518152, 0.35734949
+# Calibration anchored to US Patent 5,364,593 (lead acetate exposimeter):
+# white-to-black color range spans approx. 5 to 300 ppm-hours
+CAL_K, CAL_P = 1.36020, 1.18496
+NOISE_FLOOR_DELTA_E = 1.2
+
 SAFE_LIMIT = 8.0
 DANGER_LIMIT = 20.0
 STANDARD_REFERENCE = "ACGIH TLV 8-hr TWA (1 ppm) | OSHA PEL ceiling 20 ppm | NIOSH REL ceiling 10 ppm/10min"
+CALIBRATION_REFERENCE = "Dose range anchored to US Patent 5,364,593 (lead acetate exposimeter, 5-300 ppm-hours white-to-black)"
 
 aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 aruco_params = cv2.aruco.DetectorParameters()
@@ -65,6 +70,7 @@ def analyze_dosimeter():
             src_pts.append(corners[i][0][corner_pick[marker_id]])
             dst_pts.append(ideal_positions[marker_id])
 
+    # Edge case check: homography requires exactly 4 correspondence points
     if len(src_pts) < 4:
         return jsonify({"status": "Error", "message": "All 4 corner markers must be visible to align the wristband."}), 400
 
@@ -74,9 +80,9 @@ def analyze_dosimeter():
     warped = cv2.warpPerspective(image, matrix, (CARD_SIZE, CARD_SIZE))
     warped_rgb = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB).astype(np.float32)
 
-    # --- Reference patches (repositioned to avoid overlapping the 4 corner markers) ---
+    # --- Reference patches (positioned to avoid overlapping the 4 corner markers) ---
     white_roi = warped_rgb[20:60, 130:170]
-    gray_roi = warped_rgb[130:170, 240:280]     # NEW: second reference patch (mid-gray)
+    gray_roi = warped_rgb[130:170, 240:280]
 
     white_measured = np.mean(white_roi.reshape(-1, 3), axis=0)
     gray_measured = np.mean(gray_roi.reshape(-1, 3), axis=0)
@@ -111,7 +117,13 @@ def analyze_dosimeter():
     current_lab = rgb2lab(avg_patch_rgb)
 
     delta_e = float(deltaE_ciede2000(unexposed_lab, current_lab)[0][0])
-    dose_ppm_hours = round(A * delta_e**2 + B * delta_e + C, 2)
+
+    # --- Noise floor gate: ignore tiny color shifts caused by camera/lighting noise ---
+    if delta_e < NOISE_FLOOR_DELTA_E:
+        delta_e = 0.0
+        dose_ppm_hours = 0.0
+    else:
+        dose_ppm_hours = round(CAL_K * (delta_e ** CAL_P), 2)
 
     if dose_ppm_hours <= SAFE_LIMIT:
         safety_label = "SAFE"
@@ -130,6 +142,7 @@ def analyze_dosimeter():
         "safe_limit_ppm_hours": SAFE_LIMIT,
         "danger_limit_ppm_hours": DANGER_LIMIT,
         "standard_reference": STANDARD_REFERENCE,
+        "calibration_reference": CALIBRATION_REFERENCE,
         "markers_detected": len(src_pts),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "message": message,
