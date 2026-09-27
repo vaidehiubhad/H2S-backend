@@ -19,18 +19,17 @@ DANGER_LIMIT = 20.0
 STANDARD_REFERENCE = "ACGIH TLV 8-hr TWA (1 ppm) | OSHA PEL ceiling 20 ppm | NIOSH REL ceiling 10 ppm/10min"
 CALIBRATION_REFERENCE = "Dose range anchored to US Patent 5,364,593 (lead acetate exposimeter, 5-300 ppm-hours white-to-black)"
 
-# --- NEW: expiry/shelf-life patch ---
+# --- Expiry/shelf-life patch (cobalt chloride: blue = valid, pink = expired) ---
 # EXPIRY_REFERENCE_RGB is the color of a FRESH, unexpired patch measured under
 # standard lighting. PLACEHOLDER VALUE — replace once real strips are measured.
 EXPIRY_REFERENCE_RGB = np.array([[[70.0, 130.0, 180.0]]])  # steel-blue, fresh/valid state
 EXPIRY_DELTA_E_THRESHOLD = 5.0  # PLACEHOLDER — tune with accelerated-aging test data
 
-# --- NEW: sealed reference cell (temperature/humidity compensation) ---
-# SEALED_CELL_EXPECTED_RGB is the known, fixed printed-ink color of the sealed
-# swatch, measured once under standard lab conditions. It does not react to H2S.
-# PLACEHOLDER VALUE — replace once real sealed cells are measured.
-SEALED_CELL_EXPECTED_RGB = np.array([[[140.0, 150.0, 140.0]]])
-ENV_COMPENSATION_FACTOR = 1.0  # PLACEHOLDER — tune with real temp/humidity trials
+# Temperature/humidity are NOT hardware-compensated (no sealed reference cell).
+# Per the problem statement's own wording, the dose is presented as an estimate
+# instead: "colorimetric reactions don't scale perfectly linearly ... temperature
+# and humidity affect reaction speed too."
+ENV_DISCLOSURE = "Estimated dose — colorimetric readings can vary with ambient temperature and humidity."
 
 aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 aruco_params = cv2.aruco.DetectorParameters()
@@ -57,7 +56,6 @@ def analyze_dosimeter():
     if 'file' not in request.files:
         return jsonify({"error": "No image uploaded"}), 400
 
-    # --- NEW: worker ID + shift, for DGMS/OISD-style occupational health records ---
     worker_id = request.form.get('worker_id', 'unknown')
     shift = request.form.get('shift', 'unspecified')
 
@@ -133,27 +131,15 @@ def analyze_dosimeter():
     avg_patch_rgb = np.mean(patch_roi, axis=(0, 1)).reshape(1, 1, 3) / 255.0
     current_lab = rgb2lab(avg_patch_rgb)
 
-    raw_delta_e = float(deltaE_ciede2000(unexposed_lab, current_lab)[0][0])
+    delta_e = float(deltaE_ciede2000(unexposed_lab, current_lab)[0][0])
 
-    # --- NEW: expiry/shelf-life patch (rows230:290, cols70:140 on the 300x300 card) ---
+    # --- Expiry/shelf-life patch (rows230:290, cols70:140 on the 300x300 card) ---
     expiry_roi = normalized_rgb[230:290, 70:140]
     avg_expiry_rgb = np.mean(expiry_roi, axis=(0, 1)).reshape(1, 1, 3) / 255.0
     expiry_lab = rgb2lab(avg_expiry_rgb)
     expiry_reference_lab = rgb2lab(EXPIRY_REFERENCE_RGB / 255.0)
     expiry_delta_e = float(deltaE_ciede2000(expiry_reference_lab, expiry_lab)[0][0])
     badge_status = "expired" if expiry_delta_e > EXPIRY_DELTA_E_THRESHOLD else "valid"
-
-    # --- NEW: sealed reference cell (rows230:290, cols160:230) — temp/humidity compensation ---
-    sealed_roi = normalized_rgb[230:290, 160:230]
-    avg_sealed_rgb = np.mean(sealed_roi, axis=(0, 1)).reshape(1, 1, 3) / 255.0
-    sealed_lab = rgb2lab(avg_sealed_rgb)
-    sealed_expected_lab = rgb2lab(SEALED_CELL_EXPECTED_RGB / 255.0)
-    env_drift_delta_e = float(deltaE_ciede2000(sealed_expected_lab, sealed_lab)[0][0])
-
-    # Subtract the environmental drift measured on the sealed (non-reactive) cell
-    # from the main patch reading, since both patches share the same ambient
-    # temperature/humidity conditions.
-    delta_e = max(raw_delta_e - env_drift_delta_e * ENV_COMPENSATION_FACTOR, 0.0)
 
     # --- Noise floor gate: ignore tiny color shifts caused by camera/lighting noise ---
     if delta_e < NOISE_FLOOR_DELTA_E:
@@ -172,13 +158,13 @@ def analyze_dosimeter():
         safety_label = "DANGER"
         message = f"🛑 DANGER: Exposure exceeds safe limit! ({dose_ppm_hours} ppm·h) — remove worker from area and seek fresh air immediately."
 
+    message += f" | {ENV_DISCLOSURE}"
+
     if badge_status == "expired":
         message += " | ⚠ Badge expiry patch indicates this badge is expired — dose reading may not be reliable."
 
     return jsonify({
         "delta_e": round(delta_e, 2),
-        "raw_delta_e": round(raw_delta_e, 2),
-        "env_drift_delta_e": round(env_drift_delta_e, 2),
         "ppm_hours": dose_ppm_hours,
         "status": safety_label,
         "badge_status": badge_status,
